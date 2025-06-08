@@ -3,7 +3,7 @@
 Usage: portchecker -H <ssh_host> [ssh_host ...] [-f host_or_file ...]
           [-l] [-s target_or_file ... | -t target_ip ... | -d target_or_file ...]
           [-p port ...] [-h]
-
+ 
 Options:
   -H HOST     SSH source host(s), space-separated
   -f ITEM     File or SSH host(s) (accepts mixed input)
