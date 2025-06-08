@@ -1,0 +1,200 @@
+#!/bin/bash
+# Author: Christopher Atienza - Script will perform port checking without using telnet or nc
+
+set -euo pipefail
+
+declare -a SSH_HOSTS
+declare -a TARGETS
+declare -a PORTS
+
+SYSTEM_FILE=""
+LOCAL_MODE=0
+
+DEFAULT_PORTS_FOR_SYSTEMS=("6556" "80" "443" "22" "161")
+
+# Help message
+show_help() {
+    cat <<EOF
+Usage: $0 -H <ssh_host> [ssh_host ...] [-f host_or_file ...]
+          [-l] [-s target_or_file ... | -t target_ip ... | -d target_or_file ...]
+          [-p port ...] [-h]
+
+Options:
+  -H HOST     SSH source host(s), space-separated
+  -f ITEM     File or SSH host(s) (accepts mixed input)
+  -l          Run checks from local host instead of via SSH
+  -s ITEM     File or system target(s); implies ports 6556 22 161
+  -t IP       Manual target IP(s), comma- or space-separated
+  -d ITEM     File or target IP(s) (accepts mixed input)
+  -p PORT     Ports to check (required if -s is not used)
+  -h          Show this help message
+EOF
+    exit 0
+}
+
+# Show help if no arguments provided
+if [[ $# -eq 0 ]]; then
+    show_help
+fi
+
+# Get local IP with fallback
+get_local_ip() {
+    local ip
+    ip=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    if [[ -z "$ip" ]]; then
+        ip=$(hostname -I | awk '{print $1}')
+    fi
+    echo "$ip"
+}
+
+# Parse comma-separated list into array
+split_and_add() {
+    local input="$1"
+    local -n out_array=$2
+    IFS=',' read -ra PARTS <<< "$input"
+    for part in "${PARTS[@]}"; do
+        [[ -n "$part" ]] && out_array+=("$part")
+    done
+}
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -H)
+            shift
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                split_and_add "$1" SSH_HOSTS
+                shift
+            done
+            ;;
+        -f)
+            shift
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                if [[ -f "$1" ]]; then
+                    while IFS= read -r line; do
+                        split_and_add "$line" SSH_HOSTS
+                    done < "$1"
+                else
+                    split_and_add "$1" SSH_HOSTS
+                fi
+                shift
+            done
+            ;;
+        -s)
+            shift
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                if [[ -f "$1" ]]; then
+                    while IFS= read -r line; do
+                        split_and_add "$line" TARGETS
+                    done < "$1"
+                else
+                    split_and_add "$1" TARGETS
+                fi
+                shift
+            done
+            PORTS=("${DEFAULT_PORTS_FOR_SYSTEMS[@]}")
+            ;;
+        -t)
+            shift
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                split_and_add "$1" TARGETS
+                shift
+            done
+            ;;
+        -d)
+            shift
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                if [[ -f "$1" ]]; then
+                    while IFS= read -r line; do
+                        split_and_add "$line" TARGETS
+                    done < "$1"
+                else
+                    split_and_add "$1" TARGETS
+                fi
+                shift
+            done
+            ;;
+        -p)
+            shift
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                split_and_add "$1" PORTS
+                shift
+            done
+            ;;
+        -l)
+            LOCAL_MODE=1
+            shift
+            ;;
+        -h)
+            show_help
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Validation
+if [[ $LOCAL_MODE -eq 0 && ${#SSH_HOSTS[@]} -eq 0 ]]; then
+    echo "Error: No SSH source hosts (-H/-f), or use -l" >&2
+    show_help
+fi
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    echo "Error: No target IPs (-s, -t, or -d)" >&2
+    show_help
+fi
+
+if [[ ${#PORTS[@]} -eq 0 ]]; then
+    echo "Error: No ports (-p), or -s must be used to auto-load ports" >&2
+    show_help
+fi
+
+# Check ports
+check_remote() {
+    local SRC="$1"
+    local TGT="$2"
+    local PORT="$3"
+
+    LOCAL_IP=$(get_local_ip)
+
+    if [[ "$SRC" == "$LOCAL_IP" ]]; then
+        timeout 3 bash -c "</dev/tcp/$TGT/$PORT" &>/dev/null
+    else
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$SRC" "timeout 3 bash -c '</dev/tcp/$TGT/$PORT'" &>/dev/null
+    fi
+
+    if [[ $? -eq 0 ]]; then
+        echo "[+] $SRC: $TGT:$PORT is OPEN"
+    else
+        echo "[-] $SRC: $TGT:$PORT is CLOSED-or-unreachable"
+    fi
+}
+
+export -f check_remote
+export -f get_local_ip
+export -f split_and_add
+
+# Job generator
+generate_jobs() {
+    if [[ $LOCAL_MODE -eq 1 ]]; then
+        local LOCAL_IP
+        LOCAL_IP=$(get_local_ip)
+        for TGT in "${TARGETS[@]}"; do
+            for PORT in "${PORTS[@]}"; do
+                echo "$LOCAL_IP $TGT $PORT"
+            done
+        done
+    else
+        for SRC in "${SSH_HOSTS[@]}"; do
+            for TGT in "${TARGETS[@]}"; do
+                for PORT in "${PORTS[@]}"; do
+                    echo "$SRC $TGT $PORT"
+                done
+            done
+        done
+    fi
+}
+
+generate_jobs | xargs -P 4000 -n 3 bash -c 'check_remote "$0" "$1" "$2"'
